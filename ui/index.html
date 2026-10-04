@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Task Worker</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2330; --mute:#6b7585; --line:#e3e6ec; --accent:#2f5bea;
+          --ok:#1a7f4b; --bad:#c0392b; --warn:#b7791f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151b; --card:#1b2029; --ink:#e7eaf0; --mute:#8b94a5; --line:#2a303c; --accent:#6d8cff;
+            --ok:#4cc38a; --bad:#ff7a6b; --warn:#e5b567; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui, sans-serif;
+         display:flex; flex-direction:column; height:100vh; }
+  header { display:flex; align-items:center; gap:14px; padding:10px 16px; background:var(--card);
+           border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; flex:1; }
+  header label { color:var(--mute); font-size:13px; display:flex; gap:6px; align-items:center; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--mute); display:inline-block; }
+  .dot.on { background:var(--ok); animation:pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity:.35; } }
+  button { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--ink);
+           border-radius:8px; padding:6px 12px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #log { flex:1; overflow-y:auto; padding:18px 16px; display:flex; flex-direction:column; gap:10px;
+         max-width:900px; width:100%; margin:0 auto; }
+  .msg { padding:10px 14px; border-radius:12px; max-width:85%; white-space:pre-wrap; word-wrap:break-word; }
+  .user { align-self:flex-end; background:var(--accent); color:#fff; }
+  .bot { align-self:flex-start; background:var(--card); border:1px solid var(--line); }
+  .info { align-self:center; color:var(--mute); font-size:13px; }
+  .stages { align-self:flex-start; width:100%; max-width:420px; background:var(--card); border:1px solid var(--line);
+            border-radius:12px; padding:10px 14px; display:flex; flex-direction:column; gap:6px; }
+  .stage { display:flex; gap:10px; align-items:center; color:var(--mute); }
+  .stage .icon { width:18px; text-align:center; }
+  .stage.active { color:var(--ink); font-weight:600; }
+  .stage.active .icon { animation:pulse 1.2s infinite; }
+  .stage.done { color:var(--ink); } .stage.done .icon { color:var(--ok); }
+  .stage.bad { color:var(--ink); } .stage.bad .icon { color:var(--bad); }
+  .stage.skipped { opacity:.6; }
+  .prompt { border-color:var(--warn); }
+  .prompt .row { display:flex; gap:8px; margin-top:8px; }
+  .prompt input { flex:1; padding:6px 10px; border-radius:8px; border:1px solid var(--line);
+                  background:var(--bg); color:var(--ink); font:inherit; }
+  .result.done { border-color:var(--ok); } .result.fail { border-color:var(--bad); }
+  .badge { font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .done .badge { color:var(--ok); } .fail .badge { color:var(--bad); }
+  table { border-collapse:collapse; margin-top:8px; font-size:13px; width:100%; }
+  th, td { border:1px solid var(--line); padding:4px 8px; text-align:left; }
+  .meta { color:var(--mute); font-size:12px; margin-top:6px; }
+  form { display:flex; gap:8px; padding:12px 16px; background:var(--card); border-top:1px solid var(--line);
+         max-width:900px; width:100%; margin:0 auto; }
+  form input { flex:1; padding:10px 12px; border-radius:10px; border:1px solid var(--line);
+               background:var(--bg); color:var(--ink); font:inherit; }
+  .examples { align-self:center; display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+  .examples button { font-size:13px; color:var(--mute); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 AI Task Worker</h1>
+  <span><span id="dot" class="dot"></span> <span id="state">connecting…</span></span>
+  <label><input type="checkbox" id="visible"> show browser</label>
+  <label title="Off = it decides by itself and never asks you"><input type="checkbox" id="askq"> allow questions</label>
+  <button id="reset">Reset ERP data</button>
+  <button id="stop" disabled>Stop</button>
+</header>
+<div id="log"></div>
+<form id="form" autocomplete="off">
+  <input id="input" placeholder="Describe a task, e.g. “Find the latest invoice from Acme Supplies and enter it into the ERP”" autofocus>
+  <button class="primary" id="send">Send</button>
+</form>
+
+<script>
+const log = document.getElementById('log'), input = document.getElementById('input');
+const state = document.getElementById('state'), dot = document.getElementById('dot');
+const stopBtn = document.getElementById('stop'), sendBtn = document.getElementById('send');
+let ws, running = false, tracker = null, awaiting = null;
+
+const EXAMPLES = [
+  "Find the latest invoice from Acme Supplies, extract the amount and due date, enter it into our internal system, and tell me once it is done.",
+  "What bills are currently in the ERP?",
+  "Find the latest invoice from Globex Corp and enter it into the ERP."
+];
+
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+function add(node) { log.appendChild(node); log.scrollTop = log.scrollHeight; return node; }
+function say(text, cls) { return add(el('div', 'msg ' + cls, text)); }
+const STAGES = [['plan', 'Planning'], ['work', 'Finding / doing the work'], ['verify', 'Verifying'], ['result', 'Result']];
+const ICONS = {pending: '○', active: '⏳', done: '✓', bad: '✗', skipped: '–'};
+function newTracker() {
+  const box = add(el('div', 'stages')), rows = {}, attempts = {verify: 0};
+  STAGES.forEach(([key, label]) => {
+    const row = el('div', 'stage pending'); row.appendChild(el('span', 'icon', ICONS.pending)); row.appendChild(el('span', 'label', label));
+    box.appendChild(row); rows[key] = row;
+  });
+  tracker = {box, rows, attempts, status: {}};
+}
+function stage(key, status, label) {
+  if (!tracker) return;
+  const row = tracker.rows[key]; tracker.status[key] = status;
+  row.className = 'stage ' + status; row.firstChild.textContent = ICONS[status];
+  if (label) row.lastChild.textContent = label;
+  log.scrollTop = log.scrollHeight;
+}
+function setRunning(r) {
+  running = r; dot.classList.toggle('on', r); state.textContent = r ? 'working…' : 'idle';
+  stopBtn.disabled = !r; sendBtn.disabled = r && !awaiting;
+}
+
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => { state.textContent = 'idle'; };
+  ws.onclose = () => { state.textContent = 'disconnected — retrying…'; setTimeout(connect, 1500); };
+  ws.onmessage = ev => handle(JSON.parse(ev.data));
+}
+
+function handle(m) {
+  if (m.type === 'status') setRunning(m.running);
+  else if (m.type === 'info') say(m.text, 'info');
+  else if (m.type === 'trace') {
+    if (m.event === 'phase' && m.name === 'planning') stage('plan', 'active');
+    else if (m.event === 'start') { stage('plan', 'done'); if (tracker.status.work !== 'active') stage('work', 'active'); }
+    else if (m.event === 'phase' && m.name.startsWith('subtask')) {
+      tracker.attempts.verify = 0; stage('verify', 'pending', 'Verifying');
+      stage('work', 'active', 'Finding / doing the work (part ' + m.name.split(':')[0].replace('subtask ', '') + ')');
+    }
+    else if (m.event === 'phase' && m.name.startsWith('verifying')) {
+      stage('work', 'done');
+      tracker.attempts.verify += 1;
+      stage('verify', 'active', tracker.attempts.verify > 1 ? 'Verifying (attempt ' + tracker.attempts.verify + ')' : 'Verifying');
+    } else if (m.event === 'verify') {
+      const bad = (m.criteria || []).some(c => !c.passed);
+      if (bad) { stage('verify', 'bad', 'Verifying: found a problem, fixing it'); stage('work', 'active', 'Finding / doing the work (retry)'); }
+      else stage('verify', 'done');
+    }
+  }
+  else if (m.type === 'ask') prompt('❓ ' + m.question, [], true);
+  else if (m.type === 'approve') prompt('⚠️ Approval needed for “' + m.name + '”\n' + JSON.stringify(m.args, null, 1), ['approve', 'deny'], false);
+  else if (m.type === 'done') { finishTracker(m); result(m); }
+}
+
+function finishTracker(m) {
+  if (!tracker) return;
+  const ok = m.status === 'done';
+  ['plan', 'work'].forEach(k => { if (tracker.status[k] === 'active' || tracker.status[k] === undefined) stage(k, ok ? 'done' : 'bad'); });
+  if (tracker.status.work === 'active') stage('work', ok ? 'done' : 'bad');
+  if (!tracker.status.verify) stage('verify', 'skipped', 'Verifying (not run)');
+  else if (tracker.status.verify === 'active') stage('verify', ok ? 'done' : 'bad');
+  stage('result', ok ? 'done' : 'bad', ok ? 'Result' : 'Result: ' + m.status.replace('_', ' '));
+  tracker = null;
+}
+
+function prompt(text, buttons, wantsText) {
+  const box = add(el('div', 'msg bot prompt'));
+  box.appendChild(el('div', '', text));
+  const row = el('div', 'row'); box.appendChild(row);
+  const finish = (label) => { row.remove(); box.appendChild(el('div', 'meta', 'You: ' + label)); awaiting = null; sendBtn.disabled = running && !awaiting; };
+  if (wantsText) {
+    const inp = el('input'); inp.placeholder = 'Type your answer and press Enter'; row.appendChild(inp);
+    const go = el('button', 'primary', 'Reply'); row.appendChild(go);
+    const send = () => { if (!inp.value.trim()) return; ws.send(JSON.stringify({type: 'reply', text: inp.value})); finish(inp.value); };
+    go.onclick = send; inp.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); send(); } }; inp.focus();
+  }
+  buttons.forEach(b => {
+    const btn = el('button', b === 'approve' ? 'primary' : '', b === 'approve' ? 'Approve' : 'Deny'); row.appendChild(btn);
+    btn.onclick = () => { ws.send(JSON.stringify({type: 'approval', ok: b === 'approve'})); finish(b); };
+  });
+  awaiting = box;
+}
+
+function result(m) {
+  const ok = m.status === 'done';
+  const card = add(el('div', 'msg bot result ' + (ok ? 'done' : 'fail')));
+  card.appendChild(el('div', 'badge', ok ? '✓ Done' : '✗ ' + m.status.replace('_', ' ')));
+  card.appendChild(el('div', '', m.summary));
+  if (m.bills && m.bills.length) {
+    const t = el('table'); t.innerHTML = '<tr><th>Invoice</th><th>Vendor</th><th>Amount</th><th>Due</th><th>Status</th></tr>';
+    m.bills.forEach(b => { const r = t.insertRow();
+      [b.invoice_no, b.vendor, Number(b.amount).toLocaleString(undefined, {minimumFractionDigits: 2}), b.due_date, b.status]
+        .forEach(v => { r.insertCell().textContent = v; }); });
+    card.appendChild(el('div', 'meta', 'Saved in the ERP by this task:')); card.appendChild(t);
+  }
+  const crit = m.criteria || [];
+  if (crit.length) {
+    const failed = crit.filter(c => !c.passed), unver = crit.some(c => c.name === 'UNVERIFIED');
+    card.appendChild(el('div', 'meta', unver ? '⚠ Not independently verified' : failed.length ? '⚠ Could not fully verify' : '✓ Verified (' + crit.length + ' checks passed)'));
+  }
+  card.appendChild(el('div', 'meta', m.steps + ' steps' + (m.trace_dir ? ' · evidence: ' + m.trace_dir : '')));
+}
+
+document.getElementById('form').onsubmit = e => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text || running || ws.readyState !== 1) return;
+  say(text, 'user'); input.value = ''; newTracker(); stage('plan', 'active');
+  ws.send(JSON.stringify({type: 'task', text, visible: document.getElementById('visible').checked, allow_questions: document.getElementById('askq').checked}));
+};
+stopBtn.onclick = () => ws.send(JSON.stringify({type: 'stop'}));
+document.getElementById('reset').onclick = () => ws.send(JSON.stringify({type: 'reset'}));
+
+const ex = add(el('div', 'examples'));
+EXAMPLES.forEach(t => { const b = el('button', '', t.length > 60 ? t.slice(0, 57) + '…' : t); b.onclick = () => { input.value = t; input.focus(); }; ex.appendChild(b); });
+connect();
+</script>
+</body>
+</html>
